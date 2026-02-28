@@ -79,8 +79,59 @@ class AllBlocksCleared(KVCacheEvent):
     pass
 
 
+class BlockAccessed(KVCacheEvent):
+    """Per-request block-level cache hit/miss report.
+
+    Emitted **once per prefill batch entry** after the prefix match is
+    finalized and the scheduler knows exactly which blocks were reused from
+    the KV cache and which blocks required fresh prefill computation.
+
+    The event allows downstream consumers (e.g. Dynamo's KV indexer and
+    Prometheus metrics pipeline) to track cache efficiency at block
+    granularity for every request.
+
+    Fields
+    ------
+    block_hashes : list[int]
+        Sequence block hashes for all blocks that make up this request's
+        prefix, in order.  These are the same cumulative hashes published
+        by ``BlockStored`` events (incorporating all tokens from the start
+        of the sequence through the current block), so they can be joined
+        with the indexer's stored-block state.
+
+    request_id : str
+        The unique identifier of the request within the engine.
+
+    num_cached : int
+        Number of blocks that were served from the KV cache (cache hits).
+
+    num_prefilled : int
+        Number of blocks that required fresh prefill computation
+        (cache misses).  ``num_cached + num_prefilled == len(block_hashes)``.
+
+    cached_mask : list[bool]
+        A boolean mask aligned 1-to-1 with ``block_hashes``.  ``True``
+        at position *i* means block *i* was a cache hit; ``False`` means
+        it was freshly computed.  The boundary between the ``True`` prefix
+        and the ``False`` suffix corresponds to the engine's prefix-match
+        length (the point up to which KV cache data was reused).
+
+    medium_per_block : list[Optional[str]]
+        The storage medium each block resides on (e.g. ``"GPU"``,
+        ``"CPU_PINNED"``).  ``None`` for blocks that were not cached.
+        See ``MEDIUM_GPU`` and ``MEDIUM_CPU`` module constants.
+    """
+
+    block_hashes: list[int]
+    request_id: str
+    num_cached: int
+    num_prefilled: int
+    cached_mask: list[bool]
+    medium_per_block: list[Optional[str]]
+
+
 class KVEventBatch(EventBatch):
-    events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
+    events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared, BlockAccessed]]
 
 
 class EventPublisher(ABC):

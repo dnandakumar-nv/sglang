@@ -1512,6 +1512,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         i
                     ]
 
+                # Add per-block cache status if available
+                if (
+                    hasattr(recv_obj, "block_cache_status")
+                    and recv_obj.block_cache_status
+                    and recv_obj.block_cache_status[i] is not None
+                ):
+                    meta_info["block_cache_status"] = recv_obj.block_cache_status[i]
+
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
@@ -1918,6 +1926,21 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 retraction_count,
                 cached_tokens_details,
             )
+
+            # Record block-level cache access metrics if available
+            if (
+                hasattr(recv_obj, "block_cache_status")
+                and recv_obj.block_cache_status
+                and i < len(recv_obj.block_cache_status)
+                and recv_obj.block_cache_status[i] is not None
+            ):
+                bcs = recv_obj.block_cache_status[i]
+                cached_mask = bcs.get("cached_mask", [])
+                num_cached = sum(1 for m in cached_mask if m)
+                num_prefilled = len(cached_mask) - num_cached
+                self.metrics_collector.observe_block_access(
+                    labels, num_cached, num_prefilled
+                )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
         self.dump_request_list.append(

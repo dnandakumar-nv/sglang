@@ -1020,6 +1020,28 @@ class TokenizerMetricsCollector:
             labelnames=list(labels.keys()) + ["cache_source"],
         )
 
+        self.blocks_cached_total = Counter(
+            name="sglang:blocks_cached_total",
+            documentation="Total KV cache blocks served from cache.",
+            labelnames=list(labels.keys()),
+        )
+
+        self.blocks_prefilled_total = Counter(
+            name="sglang:blocks_prefilled_total",
+            documentation="Total KV cache blocks freshly prefilled.",
+            labelnames=list(labels.keys()),
+        )
+
+        self.request_block_cache_efficiency = Histogram(
+            name="sglang:request_block_cache_efficiency",
+            documentation="Per-request block-level cache efficiency (cached / total).",
+            labelnames=list(labels.keys()),
+            buckets=[
+                0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
+                0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0,
+            ],
+        )
+
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
@@ -1211,6 +1233,20 @@ class TokenizerMetricsCollector:
                 float(generation_tokens)
             )
         self.num_retractions.labels(**labels).observe(retraction_count)
+
+    def observe_block_access(
+        self,
+        labels: Dict[str, str],
+        num_cached_blocks: int,
+        num_prefilled_blocks: int,
+    ):
+        """Record block-level cache access metrics for a single request."""
+        self.blocks_cached_total.labels(**labels).inc(num_cached_blocks)
+        self.blocks_prefilled_total.labels(**labels).inc(num_prefilled_blocks)
+        total = num_cached_blocks + num_prefilled_blocks
+        if total > 0:
+            efficiency = num_cached_blocks / total
+            self.request_block_cache_efficiency.labels(**labels).observe(efficiency)
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
         self.histogram_time_to_first_token.labels(**labels).observe(value)

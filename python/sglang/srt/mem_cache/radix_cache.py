@@ -35,8 +35,10 @@ import torch
 logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
+    MEDIUM_CPU,
     MEDIUM_GPU,
     AllBlocksCleared,
+    BlockAccessed,
     BlockRemoved,
     BlockStored,
 )
@@ -430,6 +432,7 @@ class RadixCache(BasePrefixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -863,6 +866,62 @@ class RadixCache(BasePrefixCache):
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())
+
+    def _record_access_event(
+        self,
+        req_id: str,
+        fill_ids: list,
+        cached_token_count: int,
+        cached_tokens_device: int,
+        cached_tokens_host: int,
+    ):
+        if not self.enable_kv_cache_events or len(fill_ids) == 0:
+            return
+
+        page_aligned_len = (len(fill_ids) // self.page_size) * self.page_size
+        if page_aligned_len == 0:
+            return
+
+
+        num_blocks = page_aligned_len // self.page_size
+
+        cached_blocks = cached_token_count // self.page_size
+        device_blocks = cached_tokens_device // self.page_size
+        host_blocks = cached_tokens_host // self.page_size
+
+        block_hashes = []
+        cached_mask = []
+        medium_per_block = []
+
+        prior_hash = None
+        for block_idx in range(num_blocks):
+            start = block_idx * self.page_size
+            page_tokens = fill_ids[start : start + self.page_size]
+
+            hash_str = get_hash_str(page_tokens, prior_hash=prior_hash)
+            block_hash = hash_str_to_int64(hash_str)
+            block_hashes.append(block_hash)
+            prior_hash = hash_str
+
+            cached_mask.append(block_idx < cached_blocks)
+
+            if block_idx < device_blocks:
+                medium_per_block.append(MEDIUM_GPU)
+            elif block_idx < cached_blocks:
+                medium_per_block.append(MEDIUM_CPU)
+            else:
+                medium_per_block.append(None)
+
+        self.kv_event_queue.append(
+            BlockAccessed(
+                block_hashes=block_hashes,
+                request_id=req_id,
+                num_cached=cached_blocks,
+                num_prefilled=num_blocks - cached_blocks,
+                cached_mask=cached_mask,
+                medium_per_block=medium_per_block,
+            )
+        )
 
     def take_events(self):
         """Atomically takes all events and clears the queue.
