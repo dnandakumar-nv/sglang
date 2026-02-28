@@ -739,6 +739,10 @@ class Req(ReqDllmMixin):
             False  # Track if breakdown was already computed
         )
 
+        # Per-block cache status (set during prefill scheduling)
+        self.block_cache_hashes: Optional[List[int]] = None
+        self.block_cache_mask: Optional[List[bool]] = None
+
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
         self.spec_verify_ct = 0

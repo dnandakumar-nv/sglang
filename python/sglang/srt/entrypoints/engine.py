@@ -488,6 +488,24 @@ class Engine(EngineBase):
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
+    def evict_prefix(self, token_ids, force=False):
+        """Evict a prefix from all cache tiers."""
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.evict_prefix(token_ids, force)
+        )
+
+    def demote_prefix(self, token_ids, target="host"):
+        """Demote a prefix to a lower cache tier."""
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.demote_prefix(token_ids, target)
+        )
+
+    def promote_prefix(self, token_ids):
+        """Promote a prefix back to GPU."""
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.promote_prefix(token_ids)
+        )
+
     def open_session(
         self,
         capacity_of_str_len: int,

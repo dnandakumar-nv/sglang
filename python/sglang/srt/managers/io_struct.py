@@ -1001,6 +1001,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     customized_info: Optional[Dict[str, List[Any]]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
+    # Per-block cache status (block hashes and cached mask)
+    block_cache_status: Optional[List[Optional[Dict[str, Any]]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[int]] = None
 
@@ -1226,6 +1228,65 @@ class DetachHiCacheStorageReqInput(BaseReq):
 class DetachHiCacheStorageReqOutput(BaseReq):
     success: bool
     message: str = ""
+
+
+@dataclass
+class EvictPrefixReqInput(BaseReq):
+    """Evict a prefix and its subtree from all cache tiers."""
+    token_ids: List[int] = field(default_factory=list)
+    force: bool = False
+    prefix_id: Optional[str] = None
+
+
+@dataclass
+class EvictPrefixReqOutput(BaseReq):
+    """Result of evict_prefix."""
+    success: bool = False
+    num_tokens_evicted: int = 0
+    message: str = ""
+
+
+@dataclass
+class DemotePrefixReqInput(BaseReq):
+    """Demote a prefix and its subtree to a lower cache tier."""
+    token_ids: List[int] = field(default_factory=list)
+    target: str = "host"
+    prefix_id: Optional[str] = None
+
+
+@dataclass
+class DemotePrefixReqOutput(BaseReq):
+    """Result of demote_prefix."""
+    success: bool = False
+    num_tokens_demoted: int = 0
+    message: str = ""
+
+
+@dataclass
+class PromotePrefixReqInput(BaseReq):
+    """Promote a prefix from host memory to GPU."""
+    token_ids: List[int] = field(default_factory=list)
+
+
+@dataclass
+class PromotePrefixReqOutput(BaseReq):
+    """Result of promote_prefix."""
+    success: bool = False
+    num_tokens_promoted: int = 0
+    message: str = ""
+
+
+@dataclass
+class RegisterPrefixOwnerReqInput(BaseReq):
+    """Register prefix ownership on cached tree nodes."""
+    token_ids: List[int] = field(default_factory=list)
+    prefix_id: str = ""
+
+
+@dataclass
+class RegisterPrefixOwnerReqOutput(BaseReq):
+    """Result of register_prefix_owner."""
+    success: bool = True
 
 
 @dataclass

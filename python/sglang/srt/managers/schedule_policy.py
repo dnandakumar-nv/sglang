@@ -804,6 +804,25 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
+
+                # Emit BlockAccessed event for this request
+                if hasattr(self, 'tree_cache') and hasattr(self.tree_cache, 'enable_kv_cache_events') and self.tree_cache.enable_kv_cache_events:
+                    device_cached = prefix_len - getattr(req, 'host_hit_length', 0)
+                    host_cached = getattr(req, 'host_hit_length', 0)
+                    self.tree_cache._record_access_event(
+                        req_id=req.rid,
+                        fill_ids=list(req.fill_ids) if hasattr(req.fill_ids, '__len__') else req.fill_ids,
+                        cached_token_count=prefix_len,
+                        cached_tokens_device=max(device_cached, 0),
+                        cached_tokens_host=max(host_cached, 0),
+                    )
+                    # Store on request for API response
+                    if self.tree_cache.kv_event_queue:
+                        from sglang.srt.disaggregation.kv_events import BlockAccessed
+                        last_event = self.tree_cache.kv_event_queue[-1]
+                        if isinstance(last_event, BlockAccessed) and last_event.request_id == req.rid:
+                            req.block_cache_hashes = last_event.block_hashes
+                            req.block_cache_mask = last_event.cached_mask
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
@@ -831,6 +850,25 @@ class PrefillAdder:
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
+
+                # Emit BlockAccessed event for this request (chunked path)
+                if hasattr(self, 'tree_cache') and hasattr(self.tree_cache, 'enable_kv_cache_events') and self.tree_cache.enable_kv_cache_events:
+                    device_cached = prefix_len - getattr(req, 'host_hit_length', 0)
+                    host_cached = getattr(req, 'host_hit_length', 0)
+                    self.tree_cache._record_access_event(
+                        req_id=req.rid,
+                        fill_ids=list(req.fill_ids) if hasattr(req.fill_ids, '__len__') else req.fill_ids,
+                        cached_token_count=prefix_len,
+                        cached_tokens_device=max(device_cached, 0),
+                        cached_tokens_host=max(host_cached, 0),
+                    )
+                    # Store on request for API response
+                    if self.tree_cache.kv_event_queue:
+                        from sglang.srt.disaggregation.kv_events import BlockAccessed
+                        last_event = self.tree_cache.kv_event_queue[-1]
+                        if isinstance(last_event, BlockAccessed) and last_event.request_id == req.rid:
+                            req.block_cache_hashes = last_event.block_hashes
+                            req.block_cache_mask = last_event.cached_mask
 
         return self.budget_state()
 

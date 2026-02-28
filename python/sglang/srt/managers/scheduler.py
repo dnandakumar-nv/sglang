@@ -89,9 +89,13 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
+    DemotePrefixReqInput,
+    DemotePrefixReqOutput,
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EvictPrefixReqInput,
+    EvictPrefixReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -115,6 +119,10 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     ProfileReq,
+    PromotePrefixReqInput,
+    PromotePrefixReqOutput,
+    RegisterPrefixOwnerReqInput,
+    RegisterPrefixOwnerReqOutput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -1050,6 +1058,10 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
+                (EvictPrefixReqInput, self.evict_prefix_wrapped),
+                (DemotePrefixReqInput, self.demote_prefix_wrapped),
+                (PromotePrefixReqInput, self.promote_prefix_wrapped),
+                (RegisterPrefixOwnerReqInput, self.register_prefix_owner_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -2494,6 +2506,52 @@ class Scheduler(
             logging.warning("Hierarchical cache is not enabled.")
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
+
+    def evict_prefix_wrapped(self, recv_req: EvictPrefixReqInput):
+        num_evicted, error = self.tree_cache.evict_prefix(
+            recv_req.token_ids, recv_req.force, prefix_id=recv_req.prefix_id
+        )
+        return EvictPrefixReqOutput(
+            success=(error is None),
+            num_tokens_evicted=num_evicted,
+            message=error or f"evicted {num_evicted} tokens",
+        )
+
+    def demote_prefix_wrapped(self, recv_req: DemotePrefixReqInput):
+        if not self.enable_hierarchical_cache:
+            # No host/storage tier to demote to - clean no-op
+            return DemotePrefixReqOutput(
+                success=True,
+                num_tokens_demoted=0,
+                message="no-op: no host tier available without --enable-hierarchical-cache",
+            )
+        num_demoted, error = self.tree_cache.demote_prefix(
+            recv_req.token_ids, recv_req.target, prefix_id=recv_req.prefix_id
+        )
+        return DemotePrefixReqOutput(
+            success=(error is None),
+            num_tokens_demoted=num_demoted,
+            message=error or f"demoted {num_demoted} tokens to {recv_req.target}",
+        )
+
+    def promote_prefix_wrapped(self, recv_req: PromotePrefixReqInput):
+        if not self.enable_hierarchical_cache:
+            # No host tier to promote from - clean no-op
+            return PromotePrefixReqOutput(
+                success=True,
+                num_tokens_promoted=0,
+                message="no-op: no host tier available without --enable-hierarchical-cache",
+            )
+        num_promoted, error = self.tree_cache.promote_prefix(recv_req.token_ids)
+        return PromotePrefixReqOutput(
+            success=(error is None),
+            num_tokens_promoted=num_promoted,
+            message=error or f"promoted {num_promoted} tokens to GPU",
+        )
+
+    def register_prefix_owner_wrapped(self, recv_req: RegisterPrefixOwnerReqInput):
+        self.tree_cache.register_prefix_owner(recv_req.token_ids, recv_req.prefix_id)
+        return RegisterPrefixOwnerReqOutput(success=True)
 
     def _is_idle_for_hicache_storage_op(self) -> bool:
         """Stricter idle check for storage attach/detach.

@@ -1274,6 +1274,7 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.prefix_owners = child.prefix_owners.copy()
 
         # split value and host value if exists
         if child.evicted:
@@ -1392,3 +1393,253 @@ class HiRadixCache(RadixCache):
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+    def find_node_by_token_ids(
+        self, token_ids: List[int]
+    ) -> Optional[TreeNode]:
+        """Find the deepest tree node fully matching the given token_ids prefix.
+
+        Walks the radix tree following the token sequence, matching complete
+        node keys. Returns the last fully-matched node, or None if no match
+        beyond root.
+        """
+        if self.disable or not token_ids:
+            return None
+
+        key = RadixKey(token_ids)
+        key, _ = self.maybe_bigram_convert(key)
+        if self.page_size != 1:
+            page_aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:page_aligned_len]
+
+        if len(key) == 0:
+            return None
+
+        last_matched = None
+        node = self.root_node
+        child_key = self.get_child_key_fn(key)
+
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            prefix_len = self.key_match_fn(child.key, key)
+
+            if prefix_len > 0:
+                last_matched = child
+
+            if prefix_len < len(child.key):
+                break  # partial match within node; stop here
+
+            node = child
+            key = key[prefix_len:]
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+        return last_matched
+
+    def _collect_subtree_nodes(self, node: TreeNode) -> List[TreeNode]:
+        """Collect all nodes in the subtree rooted at `node`, in post-order.
+
+        Returns children before parents (bottom-up), which is the correct
+        order for eviction (must evict children before parents to maintain
+        tree invariants).
+        """
+        result = []
+        visited = set()
+
+        def _dfs(n):
+            if id(n) in visited:
+                return
+            visited.add(id(n))
+            for child in list(n.children.values()):
+                _dfs(child)
+            result.append(n)
+
+        _dfs(node)
+        return result
+
+    def evict_prefix(
+        self, token_ids: List[int], force: bool = False, prefix_id=None
+    ) -> tuple:
+        """Evict a prefix and all its descendants from all cache tiers.
+
+        Args:
+            token_ids: Prompt token sequence identifying the conversation.
+            force: If True, override PIN protection (but not lock_ref).
+            prefix_id: If set, only evict nodes exclusively owned by this
+                prefix_id. Shared nodes are preserved.
+
+        Returns:
+            (num_tokens_evicted, error_message_or_None)
+        """
+        node = self.find_node_by_token_ids(token_ids)
+        if node is None:
+            return (0, "prefix not found in cache")
+
+        nodes = self._collect_subtree_nodes(node)
+        num_evicted = 0
+        skipped = []
+
+        for n in nodes:
+            if n == self.root_node:
+                continue
+
+            if n.lock_ref > 0:
+                skipped.append(f"node locked (active request)")
+                continue
+
+            # Prefix-ownership filtering
+            if prefix_id is not None:
+                n.prefix_owners.discard(prefix_id)
+                if n.prefix_owners:
+                    continue  # shared node — other owners remain
+
+            # Evict from GPU
+            if not n.evicted and n.value is not None:
+                if n.backuped:
+                    num_evicted += self._evict_backuped(n)
+                else:
+                    self._record_remove_event(n)
+                    num_evicted += self._evict_regular(n)
+                    continue  # _evict_regular deletes from tree, skip host eviction
+
+            # Evict from host
+            if n.evicted and n.backuped and n.host_value is not None:
+                if hasattr(n, 'host_ref_counter') and n.host_ref_counter > 0:
+                    skipped.append(f"node host locked")
+                    continue
+                self._record_remove_event(n)
+                self.cache_controller.evict_host(n.host_value)
+                key = self.get_child_key_fn(n.key)
+                if key in n.parent.children:
+                    n.parent.children.pop(key)
+                if n in self.evictable_host_leaves:
+                    self.evictable_host_leaves.remove(n)
+                self._update_host_leaf_status(n.parent)
+
+        logger.info(
+            "[CACHE_CTRL] evict_prefix: evicted %d tokens, skipped %d nodes",
+            num_evicted,
+            len(skipped),
+        )
+        if skipped and num_evicted == 0:
+            return (0, "; ".join(skipped))
+        return (num_evicted, None)
+
+    def demote_prefix(
+        self, token_ids: List[int], target: str = "host", prefix_id=None
+    ) -> tuple:
+        """Demote a prefix and all its descendants to a lower cache tier.
+
+        GPU -> host: Frees GPU memory but keeps blocks in host (fast reload).
+        host -> storage: Archives host blocks to storage backend.
+
+        Does NOT emit BlockRemoved - the router still considers the blocks
+        reachable (via load_back on the next cache hit).
+
+        Args:
+            token_ids: Prompt token sequence identifying the conversation.
+            target: "host" for GPU->CPU, "storage" for CPU->disk.
+            prefix_id: If set, only demote nodes exclusively owned by this
+                prefix_id. Shared nodes are preserved.
+
+        Returns:
+            (num_tokens_demoted, error_message_or_None)
+        """
+        node = self.find_node_by_token_ids(token_ids)
+        if node is None:
+            return (0, "prefix not found in cache")
+
+        nodes = self._collect_subtree_nodes(node)
+        num_demoted = 0
+        skipped = []
+
+        for n in nodes:
+            if n == self.root_node:
+                continue
+
+            if n.lock_ref > 0:
+                skipped.append(f"node locked")
+                continue
+
+            # Prefix-ownership filtering
+            if prefix_id is not None:
+                n.prefix_owners.discard(prefix_id)
+                if n.prefix_owners:
+                    continue  # shared node — other owners remain
+
+            if target == "host":
+                if n.evicted:
+                    continue  # already demoted
+
+                # Ensure host copy exists
+                if not n.backuped:
+                    written = self.write_backup(n, write_back=True)
+                    if written == 0:
+                        skipped.append(f"node backup failed (host full?)")
+                        continue
+
+                # Wait for pending writes
+                self.writing_check(write_back=True)
+
+                # Free GPU, keep host
+                num_demoted += self._evict_backuped(n)
+
+            elif target == "storage":
+                if not n.backuped:
+                    if not n.evicted:
+                        written = self.write_backup(n, write_back=True)
+                        if written == 0:
+                            skipped.append(f"node backup failed")
+                            continue
+                        self.writing_check(write_back=True)
+                    else:
+                        skipped.append(f"node no host copy for storage write")
+                        continue
+
+                self.write_backup_storage(n)
+                num_demoted += len(n.host_value) if n.host_value is not None else 0
+
+            else:
+                return (0, f"unknown target: {target!r}")
+
+        logger.info(
+            "[CACHE_CTRL] demote_prefix: demoted %d tokens to %s, skipped %d nodes",
+            num_demoted,
+            target,
+            len(skipped),
+        )
+        if skipped and num_demoted == 0:
+            return (0, "; ".join(skipped))
+        return (num_demoted, None)
+
+    def promote_prefix(
+        self, token_ids: List[int]
+    ) -> tuple:
+        """Promote a prefix from host memory back to GPU.
+
+        Args:
+            token_ids: Prompt token sequence identifying the conversation.
+
+        Returns:
+            (num_tokens_promoted, error_message_or_None)
+        """
+        node = self.find_node_by_token_ids(token_ids)
+        if node is None:
+            return (0, "prefix not found in cache")
+
+        if not node.evicted:
+            return (0, None)  # Already on GPU - success, not an error
+
+        if not node.backuped:
+            return (0, "not in host memory")
+
+        device_indices = self.load_back(node)
+        if device_indices is not None:
+            num_promoted = len(device_indices)
+            logger.info(
+                "[CACHE_CTRL] promote_prefix: promoted %d tokens to GPU",
+                num_promoted,
+            )
+            return (num_promoted, None)
+        else:
+            return (0, "GPU allocation failed (insufficient memory after eviction attempt)")

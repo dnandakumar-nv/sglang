@@ -32,10 +32,14 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DemotePrefixReqInput,
+    DemotePrefixReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    EvictPrefixReqInput,
+    EvictPrefixReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -62,6 +66,10 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    PromotePrefixReqInput,
+    PromotePrefixReqOutput,
+    RegisterPrefixOwnerReqInput,
+    RegisterPrefixOwnerReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -238,6 +246,18 @@ class TokenizerCommunicatorMixin:
         self.dumper_control_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.evict_prefix_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.demote_prefix_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.promote_prefix_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.register_prefix_owner_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -340,6 +360,22 @@ class TokenizerCommunicatorMixin:
                     DumperControlReqOutput,
                     self.dumper_control_communicator.handle_recv,
                 ),
+                (
+                    EvictPrefixReqOutput,
+                    self.evict_prefix_communicator.handle_recv,
+                ),
+                (
+                    DemotePrefixReqOutput,
+                    self.demote_prefix_communicator.handle_recv,
+                ),
+                (
+                    PromotePrefixReqOutput,
+                    self.promote_prefix_communicator.handle_recv,
+                ),
+                (
+                    RegisterPrefixOwnerReqOutput,
+                    self.register_prefix_owner_communicator.handle_recv,
+                ),
             ]
         )
 
@@ -403,6 +439,68 @@ class TokenizerCommunicatorMixin:
             self.server_args.hicache_storage_backend = None
             self.server_args.hicache_storage_backend_extra_config = None
         return out
+
+    async def evict_prefix(
+        self: TokenizerManager,
+        token_ids: List[int],
+        force: bool = False,
+        prefix_id: Optional[str] = None,
+    ) -> EvictPrefixReqOutput:
+        """Evict a prefix from all cache tiers."""
+        results = await self.evict_prefix_communicator(
+            EvictPrefixReqInput(token_ids=token_ids, force=force, prefix_id=prefix_id)
+        )
+        # Aggregate results across DP ranks
+        total = sum(r.num_tokens_evicted for r in results)
+        errors = [r.message for r in results if not r.success and r.message]
+        success = any(r.success for r in results)
+        message = "; ".join(errors) if errors else f"evicted {total} tokens"
+        return EvictPrefixReqOutput(
+            success=success, num_tokens_evicted=total, message=message
+        )
+
+    async def demote_prefix(
+        self: TokenizerManager,
+        token_ids: List[int],
+        target: str = "host",
+        prefix_id: Optional[str] = None,
+    ) -> DemotePrefixReqOutput:
+        """Demote a prefix to a lower cache tier."""
+        results = await self.demote_prefix_communicator(
+            DemotePrefixReqInput(token_ids=token_ids, target=target, prefix_id=prefix_id)
+        )
+        total = sum(r.num_tokens_demoted for r in results)
+        errors = [r.message for r in results if not r.success and r.message]
+        success = any(r.success for r in results)
+        message = "; ".join(errors) if errors else f"demoted {total} tokens"
+        return DemotePrefixReqOutput(
+            success=success, num_tokens_demoted=total, message=message
+        )
+
+    async def promote_prefix(
+        self: TokenizerManager, token_ids: List[int]
+    ) -> PromotePrefixReqOutput:
+        """Promote a prefix back to GPU."""
+        results = await self.promote_prefix_communicator(
+            PromotePrefixReqInput(token_ids=token_ids)
+        )
+        total = sum(r.num_tokens_promoted for r in results)
+        errors = [r.message for r in results if not r.success and r.message]
+        success = any(r.success for r in results)
+        message = "; ".join(errors) if errors else f"promoted {total} tokens"
+        return PromotePrefixReqOutput(
+            success=success, num_tokens_promoted=total, message=message
+        )
+
+    async def register_prefix_owner(
+        self: TokenizerManager, token_ids: List[int], prefix_id: str
+    ) -> RegisterPrefixOwnerReqOutput:
+        """Register prefix ownership on cached tree nodes."""
+        results = await self.register_prefix_owner_communicator(
+            RegisterPrefixOwnerReqInput(token_ids=token_ids, prefix_id=prefix_id)
+        )
+        success = all(r.success for r in results)
+        return RegisterPrefixOwnerReqOutput(success=success)
 
     async def start_profile(
         self: TokenizerManager,

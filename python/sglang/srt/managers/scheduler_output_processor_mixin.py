@@ -906,6 +906,7 @@ class SchedulerOutputProcessorMixin:
         completion_tokens = []
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
+        block_cache_statuses = []  # Per-block cache status (hashes and cached mask)
         spec_verify_ct = []
         spec_accepted_tokens = []
         spec_acceptance_histogram = []
@@ -1018,6 +1019,16 @@ class SchedulerOutputProcessorMixin:
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
+
+                # Collect per-block cache status if available
+                block_cache_statuses.append(
+                    {
+                        "block_hashes": req.block_cache_hashes,
+                        "cached_mask": req.block_cache_mask,
+                    }
+                    if req.block_cache_hashes is not None
+                    else None
+                )
 
                 retraction_counts.append(req.retraction_count)
 
@@ -1144,6 +1155,7 @@ class SchedulerOutputProcessorMixin:
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
                     cached_tokens_details=cached_tokens_details,
+                    block_cache_status=block_cache_statuses,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,

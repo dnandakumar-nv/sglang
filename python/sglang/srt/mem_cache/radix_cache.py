@@ -35,8 +35,10 @@ import torch
 logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
+    MEDIUM_CPU,
     MEDIUM_GPU,
     AllBlocksCleared,
+    BlockAccessed,
     BlockRemoved,
     BlockStored,
 )
@@ -128,6 +130,8 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
+        # Set of prefix_ids that own this node (for prefix_id-aware eviction)
+        self.prefix_owners: set = set()
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0
@@ -430,6 +434,7 @@ class RadixCache(BasePrefixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -652,6 +657,152 @@ class RadixCache(BasePrefixCache):
         _dfs_helper(self.root_node)
         return torch.cat(values)
 
+    def find_node_by_token_ids(
+        self, token_ids: List[int]
+    ) -> Optional[TreeNode]:
+        """Find the deepest tree node fully matching the given token_ids prefix.
+
+        Walks the radix tree following the token sequence. Returns the last
+        fully-matched node, or None if no match beyond root.
+        """
+        if self.disable or not token_ids:
+            return None
+
+        key = RadixKey(token_ids)
+        key, _ = self.maybe_bigram_convert(key)
+        if self.page_size != 1:
+            page_aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:page_aligned_len]
+
+        if len(key) == 0:
+            return None
+
+        last_matched = None
+        node = self.root_node
+        child_key = self.get_child_key_fn(key)
+
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            prefix_len = self.key_match_fn(child.key, key)
+
+            if prefix_len > 0:
+                last_matched = child
+
+            if prefix_len < len(child.key):
+                break  # partial match within node; stop here
+
+            node = child
+            key = key[prefix_len:]
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+        return last_matched
+
+    def register_prefix_owner(self, token_ids: List[int], prefix_id: str):
+        """Register a prefix_id as owner of all tree nodes matching token_ids.
+
+        Walks the tree following token_ids and adds prefix_id to each matched
+        node's prefix_owners set.
+        """
+        if not token_ids or not prefix_id:
+            return
+
+        key = RadixKey(token_ids)
+        key, _ = self.maybe_bigram_convert(key)
+        if self.page_size != 1:
+            page_aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:page_aligned_len]
+
+        if len(key) == 0:
+            return
+
+        node = self.root_node
+        child_key = self.get_child_key_fn(key)
+
+        while len(key) > 0 and child_key in node.children:
+            child = node.children[child_key]
+            prefix_len = self.key_match_fn(child.key, key)
+
+            if prefix_len > 0:
+                child.prefix_owners.add(prefix_id)
+
+            if prefix_len < len(child.key):
+                break  # partial match within node
+
+            node = child
+            key = key[prefix_len:]
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+    def evict_prefix(
+        self, token_ids: List[int], force: bool = False, prefix_id=None
+    ) -> tuple:
+        """Evict a prefix and all its descendants from the GPU cache.
+
+        This is the base RadixCache version that works without HiCache tiers.
+        It evicts matching nodes from the GPU radix tree only.
+
+        Args:
+            token_ids: Prompt token sequence identifying the conversation.
+            force: Reserved for future use (ignored in base implementation).
+            prefix_id: If set, only evict nodes exclusively owned by this
+                prefix_id. Shared nodes (owned by other prefix_ids) are
+                preserved. If None, fall through to default behavior.
+
+        Returns:
+            (num_tokens_evicted, error_message_or_None)
+        """
+        node = self.find_node_by_token_ids(token_ids)
+        if node is None:
+            return (0, "prefix not found in cache")
+
+        # Collect subtree in post-order (children before parents)
+        nodes = []
+        visited = set()
+
+        def _dfs(n):
+            if id(n) in visited:
+                return
+            visited.add(id(n))
+            for child in list(n.children.values()):
+                _dfs(child)
+            nodes.append(n)
+
+        _dfs(node)
+
+        num_evicted = 0
+        skipped = []
+
+        for n in nodes:
+            if n == self.root_node:
+                continue
+
+            if n.lock_ref > 0:
+                skipped.append("node locked (active request)")
+                continue
+
+            # Prefix-ownership filtering: remove caller's ownership and
+            # skip nodes that still have other owners.
+            if prefix_id is not None:
+                n.prefix_owners.discard(prefix_id)
+                if n.prefix_owners:
+                    continue  # shared node — other owners remain
+
+            if n.value is not None and len(n.value) > 0:
+                self.token_to_kv_pool_allocator.free(n.value)
+                num_evicted += len(n.value)
+                self._record_remove_event(n)
+                self._delete_leaf(n)
+
+        logger.info(
+            "[CACHE_CTRL] evict_prefix (base): evicted %d tokens, skipped %d nodes",
+            num_evicted,
+            len(skipped),
+        )
+        if skipped and num_evicted == 0:
+            return (0, "; ".join(skipped))
+        return (num_evicted, None)
+
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
@@ -689,6 +840,7 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.prefix_owners = child.prefix_owners.copy()
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
@@ -863,6 +1015,62 @@ class RadixCache(BasePrefixCache):
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(AllBlocksCleared())
+
+    def _record_access_event(
+        self,
+        req_id: str,
+        fill_ids: list,
+        cached_token_count: int,
+        cached_tokens_device: int,
+        cached_tokens_host: int,
+    ):
+        if not self.enable_kv_cache_events or len(fill_ids) == 0:
+            return
+
+        page_aligned_len = (len(fill_ids) // self.page_size) * self.page_size
+        if page_aligned_len == 0:
+            return
+
+
+        num_blocks = page_aligned_len // self.page_size
+
+        cached_blocks = cached_token_count // self.page_size
+        device_blocks = cached_tokens_device // self.page_size
+        host_blocks = cached_tokens_host // self.page_size
+
+        block_hashes = []
+        cached_mask = []
+        medium_per_block = []
+
+        prior_hash = None
+        for block_idx in range(num_blocks):
+            start = block_idx * self.page_size
+            page_tokens = fill_ids[start : start + self.page_size]
+
+            hash_str = get_hash_str(page_tokens, prior_hash=prior_hash)
+            block_hash = hash_str_to_int64(hash_str)
+            block_hashes.append(block_hash)
+            prior_hash = hash_str
+
+            cached_mask.append(block_idx < cached_blocks)
+
+            if block_idx < device_blocks:
+                medium_per_block.append(MEDIUM_GPU)
+            elif block_idx < cached_blocks:
+                medium_per_block.append(MEDIUM_CPU)
+            else:
+                medium_per_block.append(None)
+
+        self.kv_event_queue.append(
+            BlockAccessed(
+                block_hashes=block_hashes,
+                request_id=req_id,
+                num_cached=cached_blocks,
+                num_prefilled=num_blocks - cached_blocks,
+                cached_mask=cached_mask,
+                medium_per_block=medium_per_block,
+            )
+        )
 
     def take_events(self):
         """Atomically takes all events and clears the queue.
