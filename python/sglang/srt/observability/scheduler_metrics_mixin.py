@@ -54,6 +54,17 @@ class PrefillStats:
     num_new_seqs: int  # len(can_run_list)
 
 
+@dataclasses.dataclass
+class ActiveRequestSummary:
+    """Per-request summary for the router's effective load computation."""
+
+    isl_tokens: int = 0
+    generated_tokens: int = 0
+    max_new_tokens: int = 0
+    priority: int = 0
+    is_prefill: bool = False
+
+
 class KvMetrics:
     def __init__(self):
         self.request_active_slots = None
@@ -64,6 +75,10 @@ class KvMetrics:
         self.gpu_cache_usage_perc = None
         self.gpu_prefix_cache_hit_rate = None
         self.data_parallel_rank = None
+        self.kv_free_blocks = None
+        self.kv_evictable_blocks = None
+        self.num_running_requests = None
+        self.active_requests = None
 
 
 class SchedulerMetricsMixin:
@@ -517,6 +532,38 @@ class SchedulerMetricsMixin:
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
         kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
+
+        # Capacity metrics for memory-aware routing.
+        # _get_token_info() returns (num_used, token_usage, available_size, evictable_size)
+        # where available_size and evictable_size are in TOKEN units.
+        _, _, available_size, evictable_size = self._get_token_info()
+        page_size = self.server_args.page_size if self.server_args.page_size else 1
+        kv_metrics.kv_free_blocks = available_size // page_size
+        kv_metrics.kv_evictable_blocks = evictable_size // page_size
+        kv_metrics.num_running_requests = (
+            len(self.running_batch.reqs) if self.running_batch else 0
+        )
+
+        # Per-request summaries for effective load computation
+        if self.running_batch and self.running_batch.reqs:
+            summaries = []
+            for req in self.running_batch.reqs:
+                summaries.append(
+                    ActiveRequestSummary(
+                        isl_tokens=len(req.origin_input_ids),
+                        generated_tokens=len(req.output_ids),
+                        max_new_tokens=(
+                            req.sampling_params.max_new_tokens
+                            if req.sampling_params.max_new_tokens
+                            else 0
+                        ),
+                        priority=req.priority if req.priority is not None else 0,
+                        is_prefill=(
+                            req.finished_reason is None and len(req.output_ids) == 0
+                        ),
+                    )
+                )
+            kv_metrics.active_requests = summaries
 
         if not self.send_metrics_from_scheduler.closed:
             self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
